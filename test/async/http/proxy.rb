@@ -114,6 +114,53 @@ AProxy = Sus::Shared("a proxy") do
 			
 			expect(proxy.client.pool).to be(:empty?)
 		end
+		
+		it "closes the tunnel when the socket is closed from another thread" do
+			proxy = Async::HTTP::Proxy.tcp(client, "localhost", 1)
+			
+			peer = proxy.connect
+			
+			peer.write(data)
+			expect(peer.readpartial(1024)).to be == data
+			
+			# This raises any error from the thread:
+			Thread.new{peer.close}.value
+			
+			expect(peer).to be(:closed?)
+			
+			current_task = Async::Task.current
+			current_task.with_timeout(1) do
+				current_task.yield while proxy.client.pool.busy?
+			end
+		ensure
+			proxy&.close
+		end
+		
+		it "doesn't close the tunnel when a copy of the socket is closed" do
+			proxy = Async::HTTP::Proxy.tcp(client, "localhost", 1)
+			
+			peer = proxy.connect
+			
+			copy = peer.clone
+			copy.close
+			
+			expect(copy).to be(:closed?)
+			expect(peer).not.to be(:closed?)
+			
+			peer.write(data)
+			peer.close_write
+			
+			expect(peer.read).to be == data
+			
+			peer.close
+			
+			current_task = Async::Task.current
+			current_task.with_timeout(1) do
+				current_task.yield while proxy.client.pool.busy?
+			end
+		ensure
+			proxy&.close
+		end
 	end
 	
 	with "independent tunnel directions" do
@@ -281,8 +328,8 @@ AProxy = Sus::Shared("a proxy") do
 	end
 	
 	with "CONNECT which fails without a response" do
-		# Call {Async::HTTP::Proxy#connect}, which is expected to fail, and return the tasks it started which are still running afterwards.
-		def tasks_left_running_by_connect(proxy, timeout: 0.5)
+		# Call {Async::HTTP::Proxy#connect}, which is expected to fail, and return the tasks it started, after giving them a chance to finish.
+		def tasks_started_by_connect(proxy, timeout: 0.5)
 			current_task = Async::Task.current
 			existing_tasks = current_task.children.to_a
 			
@@ -300,7 +347,7 @@ AProxy = Sus::Shared("a proxy") do
 			clock = Async::Clock.start
 			sleep(0.001) while tasks.any?(&:alive?) and clock.total < timeout
 			
-			return error, tasks.select(&:alive?)
+			return error, tasks
 		end
 		
 		with "remote end which closes the connection" do
@@ -327,12 +374,12 @@ AProxy = Sus::Shared("a proxy") do
 			it "doesn't leave the request running" do
 				proxy = Async::HTTP::Proxy.tcp(client, "localhost", 1)
 				
-				error, tasks = tasks_left_running_by_connect(proxy) do
+				error, tasks = tasks_started_by_connect(proxy) do
 					proxy.connect
 				end
 				
 				expect(error).to be_a(EOFError)
-				expect(tasks).to be(:empty?)
+				expect(tasks.select(&:alive?)).to be(:empty?)
 				expect(client.pool).not.to be(:busy?)
 			ensure
 				proxy&.close
@@ -349,14 +396,17 @@ AProxy = Sus::Shared("a proxy") do
 			it "doesn't leave the request running after the caller's timeout" do
 				proxy = Async::HTTP::Proxy.tcp(client, "localhost", 1)
 				
-				error, tasks = tasks_left_running_by_connect(proxy) do
+				error, tasks = tasks_started_by_connect(proxy) do
 					Async::Task.current.with_timeout(0.1) do
 						proxy.connect
 					end
 				end
 				
 				expect(error).to be_a(Async::TimeoutError)
-				expect(tasks).to be(:empty?)
+				expect(tasks.select(&:alive?)).to be(:empty?)
+				
+				# The caller has already handled the error, so it must not also fail the task writing the request:
+				expect(tasks.select(&:failed?)).to be(:empty?)
 				expect(client.pool).not.to be(:busy?)
 			ensure
 				proxy&.close
@@ -451,9 +501,9 @@ AProxy = Sus::Shared("a proxy") do
 			response = proxied_client.get("/")
 			expect(response.read).to be == "Hello World!"
 			
-			proxied_client.close
-			
 			start_time = Async::Clock.now
+			
+			proxied_client.close
 			
 			# The tunnel is released once the request has been forwarded to the proxy:
 			current_task = Async::Task.current
@@ -470,14 +520,16 @@ AProxy = Sus::Shared("a proxy") do
 		it "closes the tunnel without waiting for the remote end using a block" do
 			proxy = Async::HTTP::Proxy.tcp(client, "localhost", 80)
 			
+			start_time = nil
+			
 			proxy.connect do |peer|
 				peer.write("GET / HTTP/1.1\r\nhost: localhost\r\n\r\n")
 				
 				buffer = String.new
 				buffer << peer.readpartial(1024) until buffer.end_with?("Hello World!")
+				
+				start_time = Async::Clock.now
 			end
-			
-			start_time = Async::Clock.now
 			
 			# The tunnel is released once the request has been forwarded to the proxy:
 			current_task = Async::Task.current
@@ -628,4 +680,60 @@ end
 
 describe Async::HTTP::Protocol::HTTP2 do
 	it_behaves_like AProxy
+	
+	with "remote end which never reads from the tunnel" do
+		include Sus::Fixtures::Async::HTTP::ServerContext
+		
+		let(:protocol) {subject}
+		
+		let(:app) do
+			Protocol::HTTP::Middleware.for do |request|
+				Async::HTTP::Body::Hijack.response(request, 200, {}) do |stream|
+					sleep
+				ensure
+					stream.close
+				end
+			end
+		end
+		
+		let(:close_timeout) {0.1}
+		
+		# More than the flow control window of the stream, so it can't all be sent unless the remote end reads it:
+		let(:data) {"x" * (Async::HTTP::Protocol::HTTP2::SERVER_SETTINGS[Protocol::HTTP2::Settings::INITIAL_WINDOW_SIZE] * 2)}
+		
+		def wait_until_released(proxy)
+			current_task = Async::Task.current
+			current_task.with_timeout(close_timeout * 20) do
+				current_task.yield while proxy.client.pool.busy?
+			end
+		end
+		
+		it "resets the stream after the close timeout" do
+			proxy = Async::HTTP::Proxy.new(client, "localhost:1", close_timeout: close_timeout)
+			
+			peer = proxy.connect
+			peer.write(data)
+			peer.close
+			
+			wait_until_released(proxy)
+			
+			expect(proxy.client.pool).not.to be(:busy?)
+		ensure
+			proxy&.close
+		end
+		
+		it "resets the stream after the close timeout using a block" do
+			proxy = Async::HTTP::Proxy.new(client, "localhost:1", close_timeout: close_timeout)
+			
+			proxy.connect do |peer|
+				peer.write(data)
+			end
+			
+			wait_until_released(proxy)
+			
+			expect(proxy.client.pool).not.to be(:busy?)
+		ensure
+			proxy&.close
+		end
+	end
 end

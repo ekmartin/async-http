@@ -3,8 +3,11 @@
 ## Unreleased
 
   - Closing the socket returned by `Async::HTTP::Proxy#connect` (without a block) now closes the entire CONNECT tunnel, rather than only ending the CONNECT request body. The CONNECT response is closed immediately, and the CONNECT request is closed once any data already written to the socket has been forwarded, after which HTTP/2 proxies receive `RST_STREAM(NO_ERROR)` and HTTP/1 proxy connections are closed. `Async::HTTP::Client#close` for the proxy client no longer waits for the proxy to close its end of the tunnel. The block form of `Async::HTTP::Proxy#connect` closes the tunnel the same way when the block exits, and no longer discards data written immediately before the block exits.
+  - The tunnel is closed by a background task, so the socket can be closed from any thread. Closing a copy of the socket (e.g. `Socket#clone`) only closes the copy.
+  - Added the `close_timeout:` option to `Async::HTTP::Proxy.new` (10 seconds by default), which limits how long a closed tunnel waits for data already written to the socket to be sent. After that, an HTTP/2 proxy which has stopped reading receives `RST_STREAM(CANCEL)`. An HTTP/1 proxy connection which is blocked writing is not interrupted.
   - `Async::HTTP::Proxy::ConnectFailure#body` exposes up to 8 KiB of the proxy's response body, which often explains why the connection was rejected. I/O and protocol errors while reading it are ignored, but other errors, such as `Async::TimeoutError`, propagate to the caller.
-  - `Async::HTTP::Proxy#connect` now closes the CONNECT request body when the request fails without a response, e.g. the proxy closes the connection or the caller's timeout expires. Previously, the task writing the request body was left waiting forever on HTTP/1 proxy connections, and until the connection was closed on HTTP/2 proxy connections, where the stream is now reset.
+  - `Async::HTTP::Proxy#connect` now closes the CONNECT request body when the request fails without a response, e.g. the proxy closes the connection or the caller's timeout expires. Previously, the task writing the request body was left waiting forever on HTTP/1 proxy connections.
+  - HTTP/2 clients now send `RST_STREAM(CANCEL)` when the caller stops waiting for the response headers (e.g. its timeout expires) while the request body is still being sent. Previously, the task sending the body kept running, and never finished if the body was never finished, as for a CONNECT tunnel.
 
 ## v0.105.0
 

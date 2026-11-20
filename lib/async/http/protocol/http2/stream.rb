@@ -160,6 +160,11 @@ module Async
 						@output.start
 					end
 					
+					# @returns [Boolean] Whether the body given to {send_body} is still being sent.
+					def sending?
+						!@output.nil?
+					end
+					
 					# Called when the output terminates normally.
 					def finish_output(error = nil)
 						return if self.closed?

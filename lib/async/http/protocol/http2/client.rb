@@ -43,7 +43,16 @@ module Async
 						
 						response = create_response
 						write_request(response, request)
-						read_response(response)
+						
+						begin
+							read_response(response)
+							received = true
+						ensure
+							# If the caller stopped waiting for the response (e.g. its timeout expired) while the request body is still being sent, cancel the stream. Otherwise the task sending the body would keep running, and for a body which is never finished, such as a CONNECT tunnel, forever.
+							if !received and response.stream.sending?
+								response.stream.send_reset_stream(::Protocol::HTTP2::Error::CANCEL)
+							end
+						end
 						
 						return response
 					end

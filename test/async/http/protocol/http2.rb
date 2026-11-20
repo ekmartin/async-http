@@ -125,6 +125,34 @@ describe Async::HTTP::Protocol::HTTP2 do
 			end
 		end
 		
+		with "a response which never arrives" do
+			let(:app) do
+				Protocol::HTTP::Middleware.for do |request|
+					sleep
+				end
+			end
+			
+			it "cancels the stream if the caller stops waiting while the request body is being sent" do
+				body = Async::HTTP::Body::Writable.new
+				
+				expect do
+					Async::Task.current.with_timeout(0.1) do
+						client.post("/", {}, body)
+					end
+				end.to raise_exception(Async::TimeoutError)
+				
+				connection = client.pool.acquire
+				
+				expect(connection.streams).to be(:empty?)
+				expect(connection).to be(:reusable?)
+				
+				# The task sending the body has finished, and closed it:
+				expect(body).to be(:closed?)
+			ensure
+				client.pool.release(connection) if connection
+			end
+		end
+		
 		with "host header" do
 			let(:app) do
 				Protocol::HTTP::Middleware.for do |request|
