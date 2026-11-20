@@ -4,6 +4,7 @@
 
   - Closing the socket returned by `Async::HTTP::Proxy#connect` (without a block) now closes the entire CONNECT tunnel, rather than only ending the CONNECT request body. The CONNECT response is closed immediately, and the CONNECT request is closed once any data already written to the socket has been forwarded, after which HTTP/2 proxies receive `RST_STREAM(NO_ERROR)` and HTTP/1 proxy connections are closed. `Async::HTTP::Client#close` for the proxy client no longer waits for the proxy to close its end of the tunnel. The block form of `Async::HTTP::Proxy#connect` closes the tunnel the same way when the block exits, and no longer discards data written immediately before the block exits.
   - `Async::HTTP::Proxy::ConnectFailure#body` exposes up to 8 KiB of the proxy's response body, which often explains why the connection was rejected. I/O and protocol errors while reading it are ignored, but other errors, such as `Async::TimeoutError`, propagate to the caller.
+  - `Async::HTTP::Proxy#connect` now closes the CONNECT request body when the request fails without a response, e.g. the proxy closes the connection or the caller's timeout expires. Previously, the task writing the request body was left waiting forever on HTTP/1 proxy connections, and until the connection was closed on HTTP/2 proxy connections, where the stream is now reset.
 
 ## v0.105.0
 

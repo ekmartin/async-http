@@ -280,6 +280,90 @@ AProxy = Sus::Shared("a proxy") do
 		end
 	end
 	
+	with "CONNECT which fails without a response" do
+		# Call {Async::HTTP::Proxy#connect}, which is expected to fail, and return the tasks it started which are still running afterwards.
+		def tasks_left_running_by_connect(proxy, timeout: 0.5)
+			current_task = Async::Task.current
+			existing_tasks = current_task.children.to_a
+			
+			begin
+				yield
+			rescue => error
+			end
+			
+			expect(error).not.to be_nil
+			
+			# The connection's own background tasks are transient, and stop when the connection is closed:
+			tasks = (current_task.children.to_a - existing_tasks).reject(&:transient?)
+			
+			# Give the tasks a chance to finish:
+			clock = Async::Clock.start
+			sleep(0.001) while tasks.any?(&:alive?) and clock.total < timeout
+			
+			return error, tasks.select(&:alive?)
+		end
+		
+		with "remote end which closes the connection" do
+			let(:server_class) do
+				Class.new(Async::HTTP::Server) do
+					# Read the beginning of the request, then close the connection without responding:
+					def accept(peer, address, task: Async::Task.current)
+						peer.readpartial(1024)
+					ensure
+						peer.close
+					end
+				end
+			end
+			
+			def make_server(endpoint)
+				server_class.new(middleware, endpoint)
+			end
+			
+			# The request must not be retried, as each attempt would be closed the same way:
+			def retries
+				0
+			end
+			
+			it "doesn't leave the request running" do
+				proxy = Async::HTTP::Proxy.tcp(client, "localhost", 1)
+				
+				error, tasks = tasks_left_running_by_connect(proxy) do
+					proxy.connect
+				end
+				
+				expect(error).to be_a(EOFError)
+				expect(tasks).to be(:empty?)
+				expect(client.pool).not.to be(:busy?)
+			ensure
+				proxy&.close
+			end
+		end
+		
+		with "remote end which never responds" do
+			let(:app) do
+				Protocol::HTTP::Middleware.for do |request|
+					sleep
+				end
+			end
+			
+			it "doesn't leave the request running after the caller's timeout" do
+				proxy = Async::HTTP::Proxy.tcp(client, "localhost", 1)
+				
+				error, tasks = tasks_left_running_by_connect(proxy) do
+					Async::Task.current.with_timeout(0.1) do
+						proxy.connect
+					end
+				end
+				
+				expect(error).to be_a(Async::TimeoutError)
+				expect(tasks).to be(:empty?)
+				expect(client.pool).not.to be(:busy?)
+			ensure
+				proxy&.close
+			end
+		end
+	end
+	
 	with "data written immediately before closing" do
 		let(:received) {Async::Promise.new}
 		
