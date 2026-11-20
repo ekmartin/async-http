@@ -153,6 +153,46 @@ describe Async::HTTP::Protocol::HTTP2 do
 			end
 		end
 		
+		with "a response which never arrives while the connection is busy writing" do
+			let(:app) do
+				Protocol::HTTP::Middleware.for do |request|
+					sleep
+				end
+			end
+			
+			let(:delay) {0.5}
+			
+			it "doesn't wait for the stream to be cancelled" do
+				body = Async::HTTP::Body::Writable.new
+				
+				connection = client.pool.acquire
+				client.pool.release(connection)
+				
+				# Once the request has been sent, prevent anything else from being written, as if the remote end had stopped reading:
+				writer = Async do
+					sleep(0.05)
+					connection.synchronize{sleep(delay)}
+				end
+				
+				clock = Async::Clock.start
+				
+				expect do
+					Async::Task.current.with_timeout(0.1) do
+						client.post("/", {}, body)
+					end
+				end.to raise_exception(Async::TimeoutError)
+				
+				expect(clock.total).to be < (delay / 2.0)
+				
+				# The stream is cancelled once the connection can be written to again:
+				writer.wait
+				sleep(0.01)
+				
+				expect(connection.streams).to be(:empty?)
+				expect(body).to be(:closed?)
+			end
+		end
+		
 		with "host header" do
 			let(:app) do
 				Protocol::HTTP::Middleware.for do |request|

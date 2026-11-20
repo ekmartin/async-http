@@ -135,7 +135,8 @@ module Async
 							# chunk.clear unless chunk.frozen?
 							# GC.start
 						end
-					rescue Async::Cancel, StandardError => error
+					rescue Async::Stop, StandardError => error
+						# `Async::Stop` is the same as `Async::Cancel`, which is not defined by older versions of async.
 						raise
 					ensure
 						# Ensure the body we are reading from is fully closed:

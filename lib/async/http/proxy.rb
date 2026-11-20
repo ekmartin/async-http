@@ -36,23 +36,43 @@ module Async
 				attr :body
 			end
 			
-			# Closes a CONNECT tunnel once its socket has been closed.
+			# A CONNECT tunnel, which is closed once its socket has been closed.
 			#
 			# Closing the socket of a {Body::Pipe} only ends the CONNECT request body, so the CONNECT response would remain open (and the proxy connection busy) until the proxy closes its end of the tunnel. Instead, the CONNECT response is closed as soon as the socket is closed, and the CONNECT request is closed once any data already written to the socket has been sent. HTTP/2 then resets the stream and HTTP/1 closes the connection, neither of which can be reused after a tunnel anyway.
 			class Tunnel
 				# The default time in seconds to wait for data already written to the socket to be sent to the proxy, after the socket is closed.
 				CLOSE_TIMEOUT = 10
 				
-				# Extends the socket of a tunnel so that closing it closes the entire tunnel.
+				# Extends the socket of a tunnel so that closing it closes the entire tunnel. These methods can be called from any thread.
 				module Closable
-					# Close the socket, and then the tunnel. This can be called from any thread.
+					# Close the socket, and then the tunnel.
 					def close
+						if @tunnel
+							# Any other descriptor for the socket (e.g. from `clone`) would keep it open, and the tunnel is about to be closed, so make sure they observe the end of the stream:
+							begin
+								self.shutdown(::Socket::SHUT_RDWR)
+							rescue IOError, SystemCallError
+								# The socket is already closed or shut down.
+							end
+						end
+						
 						super
 					ensure
-						if tunnel = @tunnel
-							@tunnel = nil
-							tunnel.close
-						end
+						close_tunnel
+					end
+					
+					# Close the reading side of the socket, and then the tunnel if the writing side is also closed.
+					def close_read
+						super
+					ensure
+						close_tunnel if closed?
+					end
+					
+					# Close the writing side of the socket, and then the tunnel if the reading side is also closed.
+					def close_write
+						super
+					ensure
+						close_tunnel if closed?
 					end
 					
 					# A copy has its own file descriptor, so closing it must not close the tunnel.
@@ -61,51 +81,103 @@ module Async
 						
 						@tunnel = nil
 					end
+					
+					private
+					
+					def close_tunnel
+						if tunnel = @tunnel
+							@tunnel = nil
+							tunnel.close
+						end
+					end
 				end
 				
-				# Start a task which closes the tunnel once {close} is called.
-				# @parameter pipe [Body::Pipe] The pipe connected to the CONNECT request and response.
-				# @parameter response [Protocol::HTTP::Response] The CONNECT response.
-				# @parameter sent [Async::Promise] Resolved once the connection has finished sending the CONNECT request body.
-				# @parameter timeout [Numeric] The time in seconds to wait for the CONNECT request body to be sent.
-				def initialize(pipe, response, sent, timeout: CLOSE_TIMEOUT, parent: Task.current)
-					@pipe = pipe
-					@response = response
-					@sent = sent
+				# @parameter timeout [Numeric] The time in seconds to wait for data already written to the socket to be sent to the proxy, after the socket is closed.
+				def initialize(timeout = CLOSE_TIMEOUT)
 					@timeout = timeout
 					
-					@closed = Async::Promise.new
+					# What has happened to the tunnel: `:sent`, `:received` and `:closed`. A queue can be pushed to from any thread, and its timeout doesn't interrupt the waiting task with an exception, which Ruby 3.3.6 doesn't handle while waiting on a condition variable.
+					@events = ::Thread::Queue.new
+					
+					@input = Body::Writable.new
+					
+					# The connection closes the request body once it has finished sending it:
+					@request_body = ::Protocol::HTTP::Body::Completable.new(@input, proc{@events.push(:sent)})
+					
+					@response = nil
+					@pipe = nil
+				end
+				
+				# @attribute [Protocol::HTTP::Body::Readable] The body of the CONNECT request, which is everything written to the socket.
+				attr :request_body
+				
+				# Open the tunnel using a successful CONNECT response, and start a task which closes the tunnel once its socket is closed.
+				# @parameter response [Protocol::HTTP::Response] The CONNECT response.
+				# @returns [Socket] The socket for the tunnel, which closes the tunnel when closed.
+				def open(response, parent: Task.current)
+					@response = response
+					
+					# The response has no body if the proxy has already finished it. The pipe closes the response body once it has finished receiving it:
+					response_body = response.body || ::Protocol::HTTP::Body::Readable.new
+					response_body = ::Protocol::HTTP::Body::Completable.new(response_body, proc{@events.push(:received)})
+					
+					@pipe = Body::Pipe.new(response_body, @input, task: parent)
 					
 					parent.async(transient: true, annotation: "#{self.class} closer.", &self.method(:closer))
 					
-					@socket = pipe.to_io
-					@socket.extend(Closable)
-					@socket.instance_variable_set(:@tunnel, self)
+					socket = @pipe.to_io
+					socket.extend(Closable)
+					socket.instance_variable_set(:@tunnel, self)
+					
+					return socket
 				end
-				
-				# @attribute [Socket] The socket for the tunnel, which closes the tunnel when closed.
-				attr :socket
 				
 				# Close the tunnel. The tunnel is closed by its own task, so unlike stopping the tasks of the pipe, this can be called from any thread.
 				def close
-					@closed.resolve(true)
+					@events.push(:closed)
+				end
+				
+				# Close the request body of a tunnel which was not opened, so that the connection stops waiting for it.
+				def abort
+					@input.close
 				end
 				
 				private
 				
+				# Wait until one of the given events has happened.
+				# @returns [Symbol | Nil] The event which happened, or `nil` if the timeout expired first.
+				def wait_for(*events, timeout: nil)
+					deadline = Clock.now + timeout if timeout
+					
+					until event = events.find{|event| @happened.include?(event)}
+						if deadline
+							remaining = deadline - Clock.now
+							return nil unless remaining > 0 and happened = @events.pop(timeout: remaining)
+						else
+							happened = @events.pop
+						end
+						
+						@happened << happened
+						
+						# Once both directions have finished, there is nothing left to close:
+						@happened << :finished if @happened.include?(:sent) and @happened.include?(:received)
+					end
+					
+					return event
+				end
+				
 				def closer(task)
-					@closed.wait
+					@happened = []
+					
+					# If the tunnel finishes without the socket being closed (e.g. each side of the socket was closed separately), there is nothing to do:
+					return unless wait_for(:closed, :finished) == :closed
 					
 					# Close the CONNECT response and the socket. The pipe forwards any data already written to the socket, and then ends the CONNECT request:
 					@pipe.finish
 					
-					begin
-						task.with_timeout(@timeout) do
-							@sent.wait
-						end
-					rescue Async::TimeoutError
+					unless wait_for(:sent, timeout: @timeout)
 						# The proxy has stopped reading, so give up, which resets an HTTP/2 stream. An HTTP/1 connection which is blocked writing to the proxy is not interrupted:
-						@response.close
+						@response.close(::IO::TimeoutError.new("Timed out while closing the tunnel!"))
 					end
 				end
 			end
@@ -162,7 +234,14 @@ module Async
 			# @param address [String] the address to connect to.
 			# @param headers [Array] an optional list of headers to use when establishing the connection.
 			# @param close_timeout [Numeric] the time in seconds to wait for data already written to a tunnel to be sent to the proxy, after the tunnel is closed.
-			def initialize(client, address, headers = nil, close_timeout: Tunnel::CLOSE_TIMEOUT)
+			def initialize(client, address, headers = nil, close_timeout: Tunnel::CLOSE_TIMEOUT, **options)
+				# Headers given as a trailing hash, e.g. `Proxy.new(client, address, "proxy-authorization" => token)`, are received as keyword arguments:
+				if headers.nil?
+					headers = options unless options.empty?
+				elsif !options.empty?
+					raise ArgumentError, "unknown keywords: #{options.keys.map(&:inspect).join(', ')}"
+				end
+				
 				@client = client
 				@address = address
 				@headers = ::Protocol::HTTP::Headers[headers].freeze
@@ -181,33 +260,28 @@ module Async
 			# The tunnel is closed when the returned socket is closed, or when the block exits. Any data already written to the socket is sent to the proxy first, unless that takes longer than the close timeout.
 			# @return [Socket] a connected bi-directional socket.
 			def connect(&block)
-				input = Body::Writable.new
-				
-				# The connection closes the request body once it has finished sending it:
-				sent = Async::Promise.new
-				request_body = ::Protocol::HTTP::Body::Completable.new(input, proc{sent.resolve(true)})
+				tunnel = Tunnel.new(@close_timeout)
 				
 				begin
-					response = @client.connect(authority: @address, headers: @headers, body: request_body)
+					response = @client.connect(authority: @address, headers: @headers, body: tunnel.request_body)
 				ensure
 					# If the request failed, e.g. the proxy closed the connection or the caller's timeout expired, a task may still be waiting to read the request body, and would never finish:
-					input.close unless response
+					tunnel.abort unless response
 				end
 				
 				if response.success?
-					pipe = Body::Pipe.new(response.body, input)
-					tunnel = Tunnel.new(pipe, response, sent, timeout: @close_timeout)
+					socket = tunnel.open(response)
 					
-					return tunnel.socket unless block_given?
+					return socket unless block_given?
 					
 					begin
-						yield tunnel.socket
+						yield socket
 					ensure
-						tunnel.socket.close
+						socket.close
 					end
 				else
 					# This ensures we don't leave a response dangling:
-					input.close
+					tunnel.abort
 					
 					begin
 						body = read_failure_body(response)

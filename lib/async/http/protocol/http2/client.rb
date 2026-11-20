@@ -49,12 +49,23 @@ module Async
 							received = true
 						ensure
 							# If the caller stopped waiting for the response (e.g. its timeout expired) while the request body is still being sent, cancel the stream. Otherwise the task sending the body would keep running, and for a body which is never finished, such as a CONNECT tunnel, forever.
-							if !received and response.stream.sending?
-								response.stream.send_reset_stream(::Protocol::HTTP2::Error::CANCEL)
-							end
+							cancel_stream(response.stream) unless received
 						end
 						
 						return response
+					end
+					
+					# Cancel a stream whose request body is still being sent. The caller has stopped waiting, and sending the reset can block (e.g. the remote peer is not reading), so it is sent by a separate task.
+					# @parameter stream [Stream] The stream to cancel.
+					def cancel_stream(stream)
+						return unless stream.sending?
+						
+						Async(transient: true, annotation: "Cancelling #{stream}.") do
+							stream.send_reset_stream(::Protocol::HTTP2::Error::CANCEL) if stream.sending?
+						rescue => error
+							# The stream or the connection was closed in the meantime:
+							Console.debug(self, "Failed to cancel stream!", error)
+						end
 					end
 					
 					# Write a request to the remote server via the given response stream.

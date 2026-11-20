@@ -170,10 +170,10 @@ module Async
 						@stream.wait
 					end
 					
-					# Close this response as quickly as possible. If the response body is still active, cancel the HTTP/2 exchange rather than draining it.
+					# Close this response as quickly as possible. If the response body is still active, cancel the HTTP/2 exchange rather than draining it. An error also cancels the exchange if the response has no body (left) but the request is still being sent.
 					# @parameter error [Exception | Nil] The error which closed the response.
 					def close(error = nil)
-						if @body && !@stream.closed?
+						if (@body || error) && !@stream.closed?
 							code = error ? ::Protocol::HTTP2::Error::INTERNAL_ERROR : ::Protocol::HTTP2::Error::CANCEL
 							@stream.send_reset_stream(code)
 						end

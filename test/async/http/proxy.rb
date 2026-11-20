@@ -25,6 +25,56 @@ AProxy = Sus::Shared("a proxy") do
 		end
 	end
 	
+	with ".new" do
+		let(:app) do
+			Protocol::HTTP::Middleware.for do |request|
+				Protocol::HTTP::Response[403, {}, [request.headers["proxy-authorization"].to_s]]
+			end
+		end
+		
+		it "accepts headers as a trailing hash" do
+			proxy = Async::HTTP::Proxy.new(client, "localhost:1", "proxy-authorization" => "secret")
+			
+			begin
+				proxy.connect
+			rescue Async::HTTP::Proxy::ConnectFailure => error
+			end
+			
+			expect(error.body).to be == "secret"
+			
+			current_task = Async::Task.current
+			current_task.with_timeout(1) do
+				current_task.yield while proxy.client.pool.busy?
+			end
+		ensure
+			proxy&.close
+		end
+		
+		it "accepts headers and options" do
+			proxy = Async::HTTP::Proxy.new(client, "localhost:1", {"proxy-authorization" => "secret"}, close_timeout: 1)
+			
+			begin
+				proxy.connect
+			rescue Async::HTTP::Proxy::ConnectFailure => error
+			end
+			
+			expect(error.body).to be == "secret"
+			
+			current_task = Async::Task.current
+			current_task.with_timeout(1) do
+				current_task.yield while proxy.client.pool.busy?
+			end
+		ensure
+			proxy&.close
+		end
+		
+		it "rejects unknown options" do
+			expect do
+				Async::HTTP::Proxy.new(client, "localhost:1", [], unknown: true)
+			end.to raise_exception(ArgumentError, message: be =~ /unknown/)
+		end
+	end
+	
 	with ".proxied_client" do
 		it "can construct valid client" do
 			endpoint = Async::HTTP::Endpoint.parse("http://www.codeotaku.com")
@@ -159,6 +209,84 @@ AProxy = Sus::Shared("a proxy") do
 				current_task.yield while proxy.client.pool.busy?
 			end
 		ensure
+			proxy&.close
+		end
+		
+		it "ends the stream for a copy of the socket when the socket is closed" do
+			proxy = Async::HTTP::Proxy.tcp(client, "localhost", 1)
+			
+			peer = proxy.connect
+			copy = peer.clone
+			
+			peer.close
+			
+			Async::Task.current.with_timeout(1) do
+				expect(copy.read).to be == ""
+			end
+			
+			current_task = Async::Task.current
+			current_task.with_timeout(1) do
+				current_task.yield while proxy.client.pool.busy?
+			end
+		ensure
+			copy&.close
+			proxy&.close
+		end
+		
+		it "closes the tunnel when both sides of the socket are closed separately" do
+			proxy = Async::HTTP::Proxy.tcp(client, "localhost", 1)
+			
+			current_task = Async::Task.current
+			existing_tasks = current_task.children.to_a
+			
+			peer = proxy.connect
+			
+			tasks = current_task.children.to_a - existing_tasks
+			closer = tasks.find{|task| task.annotation.to_s.include?("closer")}
+			expect(closer).to be(:alive?)
+			
+			peer.write(data)
+			peer.close_write
+			
+			expect(peer.read).to be == data
+			
+			peer.close_read
+			expect(peer).to be(:closed?)
+			
+			current_task.with_timeout(1) do
+				current_task.yield while closer.alive? or proxy.client.pool.busy?
+			end
+			
+			expect(closer).not.to be(:alive?)
+		ensure
+			proxy&.close
+		end
+		
+		it "stops waiting for the socket to be closed when the tunnel has finished" do
+			proxy = Async::HTTP::Proxy.tcp(client, "localhost", 1)
+			
+			current_task = Async::Task.current
+			existing_tasks = current_task.children.to_a
+			
+			peer = proxy.connect
+			
+			tasks = current_task.children.to_a - existing_tasks
+			closer = tasks.find{|task| task.annotation.to_s.include?("closer")}
+			
+			peer.write(data)
+			peer.close_write
+			
+			# The remote end finishes too, and the socket is never closed:
+			expect(peer.read).to be == data
+			
+			current_task.with_timeout(1) do
+				current_task.yield while closer.alive? or proxy.client.pool.busy?
+			end
+			
+			expect(closer).not.to be(:alive?)
+			expect(peer).not.to be(:closed?)
+		ensure
+			peer&.close
 			proxy&.close
 		end
 	end
@@ -705,6 +833,33 @@ describe Async::HTTP::Protocol::HTTP2 do
 			current_task = Async::Task.current
 			current_task.with_timeout(close_timeout * 20) do
 				current_task.yield while proxy.client.pool.busy?
+			end
+		end
+		
+		with "response which has already finished" do
+			let(:app) do
+				Protocol::HTTP::Middleware.for do |request|
+					# Keep the request open, without reading it:
+					hold << request
+					
+					Protocol::HTTP::Response[200, {}, nil]
+				end
+			end
+			
+			let(:hold) {[]}
+			
+			it "resets the stream after the close timeout" do
+				proxy = Async::HTTP::Proxy.new(client, "localhost:1", close_timeout: close_timeout)
+				
+				peer = proxy.connect
+				peer.write(data)
+				peer.close
+				
+				wait_until_released(proxy)
+				
+				expect(proxy.client.pool).not.to be(:busy?)
+			ensure
+				proxy&.close
 			end
 		end
 		
