@@ -133,7 +133,7 @@ module Async
 				begin
 					response = @client.connect(authority: @address, headers: @headers, body: input)
 				rescue Async::Cancel, StandardError => error
-					# The request may have already started a task which is waiting to read from the body. Closing the body ends that task, and for HTTP/2, resets the stream. Otherwise it would keep waiting, even after the connection is closed for HTTP/1:
+					# A task may already be waiting to read the request body, so close it, otherwise that task would never finish:
 					input.close(error)
 					raise
 				end
