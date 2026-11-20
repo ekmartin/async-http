@@ -35,8 +35,7 @@ module Async
 				
 				# Close the socket and stop reading from the input. Unlike {close}, the writer forwards any data already written to the socket before closing the output normally.
 				def finish
-					@reader&.stop
-					
+					@reader&.stop				
 					@tail.close
 				end
 				
